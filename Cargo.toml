@@ -1,0 +1,17 @@
+[package]
+name = "srep-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+siphasher = "1"
+aes = "0.8"
+getrandom = "0.2"
+crossbeam-channel = "0.5"
+
+[[bin]]
+name = "srep-rs"
+path = "src/main.rs"
