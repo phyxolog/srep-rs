@@ -15,7 +15,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ORACLE="$ROOT/bin/srep_darwin_aarch64"
+ORACLE="$ROOT/legacy/bin/srep"
 RS="$ROOT/target/release/srep-rs"
 WORK="$(mktemp -d)"
 PASS=0
@@ -184,6 +184,8 @@ rust_decode_case() {
 
 if [ ! -x "$ORACLE" ]; then
   echo "oracle missing: $ORACLE" >&2
+  echo "build it for this architecture with:" >&2
+  echo "  make -C \"$ROOT/legacy\"" >&2
   exit 2
 fi
 if [ ! -x "$RS" ]; then
