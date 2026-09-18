@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Deterministically generate the SREP parity corpus into a target directory."""
+
 import hashlib
 import os
 import sys
@@ -26,8 +27,9 @@ def main(outdir):
     w("one-byte.bin", b"\x00")
     for n in (511, 512, 513):
         w(f"len{n}.bin", bytes((i * 251) % 256 for i in range(n)))
-    text = (b"The quick brown fox jumps over the lazy dog. " * 4000) \
-        + (b"0123456789abcdefghijklmnopqrstuvwxyz\n" * 2000)
+    text = (b"The quick brown fox jumps over the lazy dog. " * 4000) + (
+        b"0123456789abcdefghijklmnopqrstuvwxyz\n" * 2000
+    )
     w("text.txt", text)
     w("zero-4mb.bin", b"\x00" * (4 * 1024 * 1024))
     w("rand-4mb.bin", deterministic(1, 4 * 1024 * 1024))
