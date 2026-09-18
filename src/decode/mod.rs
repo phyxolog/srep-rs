@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use crate::checksum::BlockChecksum;
 use crate::format::footer::{Footer, INDEX_LZ_FOOTER_SIZE};
 use crate::format::header::check_header;
-use crate::types::{MB, SREP_FORMAT_VERSION1, SREP_FORMAT_VERSION2, SREP_FORMAT_VERSION3, SREP_FORMAT_VERSION4};
+use crate::types::{MB, SREP_FORMAT_VERSION1, SREP_FORMAT_VERSION2, SREP_FORMAT_VERSION4};
 use storage::{LzMatchHeap, MemoryManager, VirtualMemoryManager};
 
 pub struct DecompressOptions {
@@ -94,7 +94,6 @@ pub fn decompress(
     let full_archive_header_size = 16 + hdr.hash_seed_size;
     let round_matches = hdr.format_version == SREP_FORMAT_VERSION1;
     let io_lz = hdr.format_version <= SREP_FORMAT_VERSION2;
-    let future_lz = hdr.format_version == SREP_FORMAT_VERSION3;
     let index_lz = hdr.format_version == SREP_FORMAT_VERSION4;
 
     let v4 = if index_lz {
@@ -125,13 +124,16 @@ pub fn decompress(
         let mut hbuf = vec![0u8; header_size];
         let read = fin.read(&mut hbuf).map_err(|e| e.to_string())?;
         if read == 0 {
-            if index_lz {
-                break; // block count is footer-defined; EOF here is fine
-            }
             break;
         }
-        if read < 2 * 4 && (io_lz || future_lz) {
-            break;
+        // EOF sentinel header: two zero words (applies to every format; an empty
+        // archive's footer words are 0 and are read where a block header would be).
+        if read >= 8 {
+            let b0 = u32::from_le_bytes(hbuf[0..4].try_into().unwrap());
+            let b1 = u32::from_le_bytes(hbuf[4..8].try_into().unwrap());
+            if b0 == 0 && b1 == 0 {
+                break;
+            }
         }
         if read != header_size {
             return Err("unexpected end of file in block header".to_string());
@@ -142,10 +144,6 @@ pub fn decompress(
         let literal_bytes = b0 as usize;
         let origsize = b1 as usize;
         let statsize1 = b2 as usize;
-
-        if literal_bytes == 0 && origsize == 0 && (io_lz || future_lz) {
-            break; // explicit EOF header
-        }
 
         // Resolve the match list for this block.
         let statraw: Vec<u32>;

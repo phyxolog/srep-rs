@@ -25,6 +25,18 @@ pub struct CompressOptions {
     pub layout: Layout,
     pub hash_num: u32,
     pub checksum_seed: Option<Vec<u8>>,
+    pub dictsize: u64,
+    pub dict_hashsize: u64,
+    pub dict_chunk: u64,
+}
+
+#[inline]
+fn round_up_to(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        (a + b - 1) / b * b
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -46,19 +58,23 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
     let mut l = opts.l;
     let mut min_match = opts.min_match;
     let dict_min_match = opts.dict_min_match;
+    let cdc = matches!(opts.method, 1 | 2);
     if l == 0 && min_match == 0 {
-        min_match = 512; // non-CDC default -l
+        min_match = if cdc { 4096 } else { 512 };
     }
     if l == 0 {
-        // m5 performs exhaustive search: L is half the rounded power-of-two.
-        l = if opts.method == 5 {
-            crate::matchfind::hash_table::rounddown_to_power_of_2(min_match + 1) / 2
+        if cdc {
+            l = min_match;
+            min_match = 0;
+        } else if opts.method == 5 {
+            // m5 performs exhaustive search: L is half the rounded power-of-two.
+            l = crate::matchfind::hash_table::rounddown_to_power_of_2(min_match + 1) / 2;
         } else {
-            min_match
-        };
+            l = min_match;
+        }
     }
     if min_match == 0 {
-        min_match = l;
+        min_match = if cdc { 32 } else { l };
     }
     let base_len = min_match.min(dict_min_match);
     let round_matches = opts.method == 3;
@@ -86,6 +102,25 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
     };
 
     let mut hash = HashTable::new(l, filesize, compare_digests, round_matches, min_match, 1);
+    let mut cdc_table = if cdc {
+        Some(crate::matchfind::cdc::CdcHashTable::new(l, filesize))
+    } else {
+        None
+    };
+
+    // REP (-m0) state.
+    let dictsize = if opts.dictsize != 0 { opts.dictsize as usize } else { 512 * 1024 * 1024 };
+    let dict_min_match_v = if opts.dict_min_match != 0 { opts.dict_min_match as usize } else { 512 };
+    let dict_chunk = if opts.dict_chunk != 0 { opts.dict_chunk as usize } else { dict_min_match_v / 8 };
+    let mut dict = crate::matchfind::rep::DictionaryCompressor::new(
+        dictsize,
+        opts.dict_hashsize as usize,
+        dict_min_match_v,
+        dict_chunk,
+        base_len as u32,
+    );
+    let ring_len = round_up_to(dictsize, opts.bufsize as usize) + 2 * opts.bufsize as usize;
+    let mut ring: Vec<u8> = if opts.method == 0 { vec![0u8; ring_len] } else { Vec::new() };
 
     // ---- Pass 1 ----
     let bufsize = opts.bufsize as usize;
@@ -93,21 +128,39 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
     let mut block_start: usize = 0;
     while block_start < input.len() {
         let end = (block_start + bufsize).min(input.len());
-        let block = &input[block_start..end];
-        hash.prepare_buffer(block_start as u64, block);
-        let (literal_bytes, stats) = compress_block(
-            &mut hash,
-            round_matches,
-            l,
-            min_match,
-            base_len,
-            block_start as u64,
-            input,
-            block.len(),
-        );
+        let (literal_bytes, stats) = if opts.method == 0 {
+            let bufstart = (block_start) % ring_len;
+            ring[bufstart..bufstart + (end - block_start)]
+                .copy_from_slice(&input[block_start..end]);
+            let mut hashptr: Vec<u64> = Vec::new();
+            dict.prepare_buffer(&mut hashptr, &input[block_start..end]);
+            dict.compress(&ring, ring_len, bufstart, &input[block_start..end], &hashptr)
+        } else if cdc {
+            let t = cdc_table.as_mut().unwrap();
+            crate::matchfind::cdc::compress_cdc(
+                opts.method == 2,
+                l,
+                min_match,
+                block_start as u64,
+                t,
+                &input[block_start..end],
+            )
+        } else {
+            hash.prepare_buffer(block_start as u64, &input[block_start..end]);
+            compress_block(
+                &mut hash,
+                round_matches,
+                l,
+                min_match,
+                base_len,
+                block_start as u64,
+                input,
+                end - block_start,
+            )
+        };
         blocks.push(PendingBlock {
             start: block_start,
-            size: block.len(),
+            size: end - block_start,
             stats,
             literal_bytes: literal_bytes as usize,
         });

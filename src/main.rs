@@ -160,6 +160,9 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
             layout: cli.layout,
             hash_num: desc.hash_num,
             checksum_seed: cli.checksum_seed,
+            dictsize: 0,
+            dict_hashsize: 0,
+            dict_chunk: 0,
         };
         let out = srep_rs::compress::compress(&input, &opts).map_err(|e| (4, e))?;
         let mut f = File::create(&fout_name).map_err(|e| (3, format!("Can't open {fout_name}: {e}")))?;
