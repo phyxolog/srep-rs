@@ -77,7 +77,8 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
         min_match = if cdc { 32 } else { l };
     }
     let base_len = min_match.min(dict_min_match);
-    let round_matches = opts.method == 3;
+    // ROUND_MATCHES requires method 3 AND no dictionary (dictsize unset).
+    let round_matches = opts.method == 3 && opts.dictsize == 0;
     let compare_digests = opts.method <= 3;
     let io_lz = matches!(opts.layout, Layout::IoLz);
     let future_lz = matches!(opts.layout, Layout::FutureLz);
@@ -119,8 +120,9 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
         dict_chunk,
         base_len as u32,
     );
+    let has_dict = opts.method == 0 || opts.dictsize != 0;
     let ring_len = round_up_to(dictsize, opts.bufsize as usize) + 2 * opts.bufsize as usize;
-    let mut ring: Vec<u8> = if opts.method == 0 { vec![0u8; ring_len] } else { Vec::new() };
+    let mut ring: Vec<u8> = if has_dict { vec![0u8; ring_len] } else { Vec::new() };
 
     // ---- Pass 1 ----
     let bufsize = opts.bufsize as usize;
@@ -147,6 +149,26 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
             )
         } else {
             hash.prepare_buffer(block_start as u64, &input[block_start..end]);
+            // Build the input-match stream: REP matches (if -d) + terminating fence.
+            let mut in_stats: Vec<u32> = Vec::new();
+            if opts.dictsize != 0 {
+                let bufstart = (block_start) % ring_len;
+                ring[bufstart..bufstart + (end - block_start)]
+                    .copy_from_slice(&input[block_start..end]);
+                let mut hashptr: Vec<u64> = Vec::new();
+                dict.prepare_buffer(&mut hashptr, &input[block_start..end]);
+                let (_lit, rep) = dict.compress(&ring, ring_len, bufstart, &input[block_start..end], &hashptr);
+                in_stats.extend_from_slice(&rep);
+            }
+            // Fence (beyond end-of-block sentinel).
+            encode_lz_match(
+                &mut in_stats,
+                round_matches,
+                base_len as u32,
+                (end - block_start + 1) as u32,
+                base_len as u64,
+                base_len as u32,
+            );
             compress_block(
                 &mut hash,
                 round_matches,
@@ -154,6 +176,7 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
                 min_match,
                 base_len,
                 block_start as u64,
+                &in_stats,
                 input,
                 end - block_start,
             )

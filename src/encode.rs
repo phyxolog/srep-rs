@@ -1,7 +1,7 @@
 // Single-block compressor for -m3/-m4/-m5 (fixed-size chunk matching), the
 // ACCELERATOR=0 sequential loop.
 
-use crate::format::records::encode_lz_match;
+use crate::format::records::{decode_lz_match, encode_lz_match};
 use crate::matchfind::hash_table::HashTable;
 use crate::rolling::{PolynomialRollingHash, PRIME1};
 use crate::types::{Chunk, NOT_FOUND};
@@ -173,6 +173,7 @@ pub fn compress_block(
     min_match: u64,
     base_len: u64,
     block_start: u64,
+    in_stats: &[u32],
     history: &[u8],
     block_size: usize,
 ) -> (u32, Vec<u32>) {
@@ -180,6 +181,13 @@ pub fn compress_block(
     let mut literal_bytes = block_size as u32;
     let mut stats: Vec<u32> = Vec::new();
     let mut last_match_end: usize = 0;
+
+    // Decode the first input match (REP stream + terminating fence).
+    let mut in_cur = 0usize;
+    let (mut match_start, mut match_len, mut match_offset) = {
+        let (_, m) = decode_lz_match(in_stats, &mut in_cur, false, round_matches, base_len as u32, block_start);
+        (m.dest - block_start, m.len, m.dest - m.src)
+    };
 
     if 2 * l as usize > block_size {
         return (literal_bytes, stats);
@@ -206,6 +214,38 @@ pub fn compress_block(
     while i <= block_size - 2 * l_usize {
         let next_chunk = i + l_usize;
         while i < next_chunk {
+            // Merge an input match (REP) once the hash scan reaches its start.
+            if i >= match_start as usize {
+                let ms = match_start as usize;
+                let mlen_orig = match_len as usize;
+                if ms + mlen_orig >= base_len as usize + last_match_end {
+                    let start = ms.max(last_match_end);
+                    let mlen = mlen_orig - (start - ms);
+                    let lit_len = start - last_match_end;
+                    encode_lz_match(
+                        &mut stats,
+                        round_matches,
+                        base_len as u32,
+                        lit_len as u32,
+                        match_offset,
+                        mlen as u32,
+                    );
+                    last_match_end = start + mlen;
+                    literal_bytes -= mlen as u32;
+                }
+                let (_, m2) = decode_lz_match(
+                    in_stats,
+                    &mut in_cur,
+                    false,
+                    round_matches,
+                    base_len as u32,
+                    block_start + match_start + match_len as u64,
+                );
+                match_start = m2.dest - block_start;
+                match_len = m2.len;
+                match_offset = m2.dest - m2.src;
+            }
+
             let x: usize = 4;
             let y = if last_match_end > 0 { last_match_end - 1 } else { 0 };
             let next_i = (next_chunk - 1).min(y);

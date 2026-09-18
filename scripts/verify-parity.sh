@@ -86,6 +86,19 @@ for f in empty.bin one-byte.bin len512.bin text.txt repeat-4mb.bin rand-4mb.bin;
 done
 
 # ----------------------------------------------------------------------------
+# 3b. Compression parity, dictionary (hybrid -d) modes.
+# ----------------------------------------------------------------------------
+echo "== compression parity (hybrid -d) =="
+for f in text.txt repeat-4mb.bin; do
+  src="$WORK/data/$f"
+  for opt in "-m3 -d32m" "-m4f -d32m" "-m5o -d32m"; do
+    "$ORACLE" $opt -hash- "$src" "$WORK/ref.srep" 2>/dev/null
+    "$RS" $opt -hash- "$src" "$WORK/out.srep" 2>/dev/null
+    cmp -s "$WORK/ref.srep" "$WORK/out.srep" && pass || fail "$opt $f"
+  done
+done
+
+# ----------------------------------------------------------------------------
 # 4. Compression parity, keyed modes (vmac/siphash) via seed replay.
 # ----------------------------------------------------------------------------
 echo "== compression parity (keyed, seed replay) =="

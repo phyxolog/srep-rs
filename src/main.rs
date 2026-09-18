@@ -30,6 +30,10 @@ struct Cli {
     vmfile: String,
     maximum_save: u32,
     checksum_seed: Option<Vec<u8>>,
+    dictsize: u64,
+    dict_hashsize: u64,
+    dict_chunk: u64,
+    dict_min_match: u64,
     filenames: Vec<String>,
 }
 
@@ -49,6 +53,10 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
         vmfile: "srep-virtual-memory.tmp".into(),
         maximum_save: u32::MAX,
         checksum_seed: None,
+        dictsize: 0,
+        dict_hashsize: 0,
+        dict_chunk: 0,
+        dict_min_match: 0,
         filenames: Vec::new(),
     };
 
@@ -57,6 +65,26 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
             cli.decompress = true;
         } else if a == "-f" {
             cli.layout = Layout::FutureLz;
+        } else if a == "-d-" {
+            cli.dictsize = 0;
+        } else if a == "-d+" {
+            cli.dictsize = 512 * MB;
+        } else if let Some(rest) = a.strip_prefix("-d") {
+            // -d<size>[:options] colon-separated dictionary options.
+            for part in rest.split(':') {
+                if part.is_empty() {
+                    continue;
+                }
+                let b = part.as_bytes();
+                match b[0] {
+                    b'd' => cli.dictsize = srep_rs::cli::parse_mem_option(&part[1..], 'm').unwrap_or(0),
+                    b'h' => cli.dict_hashsize = srep_rs::cli::parse_mem_option(&part[1..], 'm').unwrap_or(0),
+                    b'l' => cli.dict_min_match = srep_rs::cli::parse_mem(&part[1..], 'b').unwrap_or(0),
+                    b'c' => cli.dict_chunk = srep_rs::cli::parse_mem(&part[1..], 'b').unwrap_or(0),
+                    b'a' => {} // ignore -da
+                    _ => cli.dictsize = srep_rs::cli::parse_mem_option(part, 'm').unwrap_or(0),
+                }
+            }
         } else if let Some(rest) = a.strip_prefix("-m") {
             let d = rest.as_bytes();
             let is_method = if d.len() >= 1 && (d[0].is_ascii_digit() || d[0] == b'x') {
@@ -155,14 +183,14 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
             method: cli.method as i8,
             l: cli.l as u64,
             min_match: cli.min_match as u64,
-            dict_min_match: 512,
+            dict_min_match: if cli.dict_min_match != 0 { cli.dict_min_match } else { 512 },
             bufsize: cli.bufsize,
             layout: cli.layout,
             hash_num: desc.hash_num,
             checksum_seed: cli.checksum_seed,
-            dictsize: 0,
-            dict_hashsize: 0,
-            dict_chunk: 0,
+            dictsize: cli.dictsize,
+            dict_hashsize: cli.dict_hashsize,
+            dict_chunk: cli.dict_chunk,
         };
         let out = srep_rs::compress::compress(&input, &opts).map_err(|e| (4, e))?;
         let mut f = File::create(&fout_name).map_err(|e| (3, format!("Can't open {fout_name}: {e}")))?;
