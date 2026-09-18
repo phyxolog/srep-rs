@@ -87,6 +87,8 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
                 _ => cli.dictsize = srep_rs::cli::parse_mem_option(part, 'm').map_err(|e| (2, e))?,
                 }
             }
+        } else if let Some(v) = a.strip_prefix("-mem") {
+            cli.mem = srep_rs::cli::parse_mem_option(v, 'm').map_err(|e| (2, e))?;
         } else if let Some(rest) = a.strip_prefix("-m") {
             let d = rest.as_bytes();
             let is_method = !d.is_empty()
@@ -118,8 +120,6 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
             cli.l = srep_rs::cli::parse_mem(v, 'b').map_err(|e| (2, e))?;
         } else if let Some(v) = a.strip_prefix("-b") {
             cli.bufsize = srep_rs::cli::parse_mem(v, 'm').map_err(|e| (2, e))?;
-        } else if let Some(v) = a.strip_prefix("-mem") {
-            cli.mem = srep_rs::cli::parse_mem_option(v, 'm').map_err(|e| (2, e))?;
         } else if let Some(v) = a.strip_prefix("-vmblock=") {
             cli.vm_block = srep_rs::cli::parse_mem(v, 'm').map_err(|e| (2, e))?;
         } else if let Some(v) = a.strip_prefix("-vmfile=") {
