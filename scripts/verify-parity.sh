@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Byte-parity gate: bin/srep (reference oracle) vs target/release/srep-rs.
+# Byte-parity gate: bin/srep_darwin_aarch64 (reference oracle) vs target/release/srep-rs.
 #
 # Deterministic methods (m0 m3 m4 m5) are byte-compared across layouts and
 # checksums. m1/m2 (CDC) are excluded from *compression* byte-parity: the
@@ -8,9 +8,9 @@
 # still asserted.
 set -u
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-ORACLE="$ROOT/bin/srep"
-RS="$ROOT/srep-rs/target/release/srep-rs"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ORACLE="$ROOT/bin/srep_darwin_aarch64"
+RS="$ROOT/target/release/srep-rs"
 WORK="$(mktemp -d)"
 PASS=0
 FAIL=0
@@ -20,7 +20,7 @@ fail() { echo "FAIL: $*"; FAIL=$((FAIL + 1)); }
 if [ ! -x "$ORACLE" ]; then echo "oracle missing; run make"; exit 2; fi
 if [ ! -x "$RS" ]; then echo "srep-rs missing; run cargo build --release"; exit 2; fi
 
-python3 "$ROOT/srep-rs/scripts/gen-corpus.py" "$WORK/data" >/dev/null
+python3 "$ROOT/scripts/gen-corpus.py" "$WORK/data" >/dev/null
 
 DMODE="m0 m3 m4 m5"
 ALL="m0 m1 m2 m3 m4 m5"
