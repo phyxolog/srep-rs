@@ -1,6 +1,5 @@
-// Single-block compressor for -m3 (digest-compare, fixed-size chunks), the
-// ACCELERATOR=0 sequential loop. Produces the identical match set to the
-// reference (bit-array/lookahead only skip provably-absent hashes).
+// Single-block compressor for -m3/-m4/-m5 (fixed-size chunk matching), the
+// ACCELERATOR=0 sequential loop.
 
 use crate::format::records::encode_lz_match;
 use crate::matchfind::hash_table::HashTable;
@@ -8,65 +7,116 @@ use crate::rolling::{PolynomialRollingHash, PRIME1};
 use crate::types::{Chunk, NOT_FOUND};
 
 /// Match length from a confirmed L-byte chunk match at `start_chunk` (absolute
-/// source chunk) / `i` (block-relative target). Reproduces `match_len()` for the
-/// digest-compare path.
+/// source chunk) / `start_pos` (block-relative target). `min_pos` is
+/// last_match_end (block-relative). Returns (match_len, add_len).
+#[allow(clippy::too_many_arguments)]
 fn match_len(
     h: &HashTable,
+    compare_digests: bool,
+    round_matches: bool,
     start_chunk: Chunk,
-    start_pos: usize, // block-relative i
+    start_pos: usize,
+    min_pos: usize,
     block_size: usize,
     block_start: u64,
     history: &[u8],
-) -> u64 {
+) -> (u64, u32) {
     let l = h.l as usize;
-    let mut old_offset = start_chunk as u64 * h.l;
-    let mut p = start_pos; // block-relative
+    let mut old_offset = start_chunk as u64 * h.l; // absolute source
+    let mut p = start_pos;
+    let mut add_len: u32 = 0;
+    let bs = block_start as usize;
 
-    // Digest-based extension across chunk boundaries (old data before this block).
-    loop {
-        p += l;
-        old_offset += h.l;
-        if old_offset >= block_start {
-            break;
+    if compare_digests {
+        loop {
+            p += l;
+            old_offset += h.l;
+            if old_offset >= block_start {
+                break;
+            }
+            if block_size - p < l {
+                break;
+            }
+            let mut d = [0u8; 20];
+            h.digest.compute(&history[bs + p..bs + p + l], &mut d);
+            if d != h.digestarr[(old_offset / h.l) as usize] {
+                break;
+            }
         }
-        if block_size - p < l {
-            break;
+    } else if old_offset < block_start {
+        // Source in a previous block: reread old data.
+        let t = (start_pos - min_pos).min(l);
+        let n = (old_offset as usize).min(t);
+        if n > 0 && !round_matches {
+            let mut i = 1usize;
+            while i <= n && history[bs + start_pos - i] == history[old_offset as usize - i] {
+                i += 1;
+            }
+            add_len = (i - 1) as u32;
         }
-        let mut d = [0u8; 20];
-        let abs = block_start + p as u64;
-        h.digest.compute(&history[abs as usize..abs as usize + l], &mut d);
-        if d != h.digestarr[(old_offset / h.l) as usize] {
-            break;
+        const BUFSIZE: usize = 4096;
+        loop {
+            if old_offset >= block_start {
+                break;
+            }
+            if old_offset as usize + BUFSIZE > history.len() {
+                break; // short read -> stop
+            }
+            let old = &history[old_offset as usize..old_offset as usize + BUFSIZE];
+            let mut q = 0usize;
+            let mut full = true;
+            while q < BUFSIZE {
+                if p >= block_size || history[bs + p] != old[q] {
+                    full = false;
+                    break;
+                }
+                p += 1;
+                q += 1;
+            }
+            if !full {
+                break; // mismatch or block end
+            }
+            old_offset += BUFSIZE as u64;
         }
+    } else if !round_matches {
+        // Source within current block: backward extension.
+        let t = (start_pos - min_pos).min(l);
+        let n = ((old_offset - block_start) as usize).min(t);
+        let mut i = 1usize;
+        while i <= n
+            && history[bs + start_pos - i] == history[bs + (old_offset as usize - bs) - i]
+        {
+            i += 1;
+        }
+        add_len = (i - 1) as u32;
     }
 
-    // Byte-compare with the data in the current block (and, when the source
-    // briefly precedes the block start, the immediately-preceding data).
+    // Byte-compare with data in the current block (and, when the source briefly
+    // precedes block start, immediately-preceding data).
     let p0 = p;
-    let src_rel = old_offset as i128 - block_start as i128; // absolute source offset
-    // Source byte advances alongside target; both are absolute positions.
-    let block_start_usize = block_start as usize;
     loop {
         if p >= block_size {
             break;
         }
-        let target = history[block_start_usize + p];
-        let src_abs = src_rel + (p as i128 - p0 as i128);
-        if src_abs < 0 || src_abs as usize >= history.len() {
-            break; // reference reads out-of-bounds here; terminate conservatively
+        let target = history[bs + p];
+        let src_abs = old_offset + (p as u64 - p0 as u64);
+        if src_abs >= history.len() as u64 {
+            break;
         }
         if target != history[src_abs as usize] {
             break;
         }
         p += 1;
     }
-    (p - start_pos) as u64
+
+    ((p - start_pos) as u64, add_len)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn record_match(
     h: &HashTable,
     round_matches: bool,
+    compare_digests: bool,
     l: u64,
     min_match: u64,
     base_len: u64,
@@ -79,10 +129,20 @@ fn record_match(
     i: usize,
     k: Chunk,
 ) -> Option<usize> {
-    let match_len = match_len(h, k, i, block_size, block_start, history);
-    if match_len >= min_match {
-        let match_start = i; // add_len == 0 for m3
-        let mut match_len = match_len;
+    let (match_len, add_len) = match_len(
+        h,
+        compare_digests,
+        round_matches,
+        k,
+        i,
+        last_match_end,
+        block_size,
+        block_start,
+        history,
+    );
+    if match_len + add_len as u64 >= min_match {
+        let match_start = i - add_len as usize;
+        let mut match_len = match_len + add_len as u64;
         if round_matches {
             match_len = match_len / l * l;
         }
@@ -103,7 +163,9 @@ fn record_match(
     }
 }
 
-/// Compress one block into `stats` (match list). `buf` is `history[block_start..]`.
+/// Compress one block into a match list. `history` is the full input up to and
+/// including this block; `block_start` points at this block within `history`.
+#[allow(clippy::too_many_arguments)]
 pub fn compress_block(
     h: &mut HashTable,
     round_matches: bool,
@@ -114,6 +176,7 @@ pub fn compress_block(
     history: &[u8],
     block_size: usize,
 ) -> (u32, Vec<u32>) {
+    let compare_digests = h.compare_digests;
     let mut literal_bytes = block_size as u32;
     let mut stats: Vec<u32> = Vec::new();
     let mut last_match_end: usize = 0;
@@ -123,71 +186,46 @@ pub fn compress_block(
     }
 
     let mut hash1 = PolynomialRollingHash::new(l as usize, PRIME1);
-
-    // Fence position (no input matches for pure m3): match_start = block_size+1,
-    // so the "process input match" branch never fires.
-    let mut i: usize = 0;
+    let bs = block_start as usize;
 
     // Special handling for the first L bytes.
-    hash1.moveto(&history[block_start as usize..]);
-    // check_match(0, hash2 == hash1)
-    let k = {
-        let hv = hash1.value;
-        h.find_match(&history[block_start as usize..], 0, hv)
-    };
+    hash1.moveto(&history[bs..]);
+    let k = h.find_match(&history[bs..], 0, hash1.value, block_size);
     if k != NOT_FOUND {
         if let Some(mend) = record_match(
-            h,
-            round_matches,
-            l,
-            min_match,
-            base_len,
-            block_start,
-            history,
-            block_size,
-            &mut stats,
-            last_match_end,
-            &mut literal_bytes,
-            0,
-            k,
+            h, round_matches, compare_digests, l, min_match, base_len, block_start, history,
+            block_size, &mut stats, last_match_end, &mut literal_bytes, 0, k,
         ) {
             last_match_end = mend;
         }
     }
-    h.add_hash(block_start, 0, hash1.value);
+    h.add_hash(block_start, 0, hash1.value, block_size, &history[bs..]);
 
     let l_usize = l as usize;
-    // Main cycle, processing one L-byte chunk per outer iteration.
+    let mut i: usize = 0;
     while i <= block_size - 2 * l_usize {
         let next_chunk = i + l_usize;
         while i < next_chunk {
-            // Fast-forward the hash across the matched region.
             let x: usize = 4;
             let y = if last_match_end > 0 { last_match_end - 1 } else { 0 };
             let next_i = (next_chunk - 1).min(y);
             if next_i >= i + l_usize / 2 {
                 i = next_i & !(x - 1);
-                hash1.moveto(&history[block_start as usize + i..]);
+                hash1.moveto(&history[bs + i..]);
             } else {
                 while i + x <= next_i {
-                    let off = block_start as usize + i; // block-rel prefix
-                    let window = &history[off..];
-                    hash1.update_n::<4>(window);
+                    hash1.update_n::<4>(&history[bs + i..]);
                     i += x;
                 }
             }
 
             let lookahead: usize = 128;
             let last_i = next_chunk.min(i + lookahead);
-            // Collect candidats (positions in [last_match_end, block_end)).
             let mut candidates: Vec<(u64, usize)> = Vec::new();
             while i < last_i {
                 let mut j = 0;
                 while j < 4 && i < last_i {
-                    hash1.update_byte(
-                        history[block_start as usize + i],
-                        history[block_start as usize + i + l_usize],
-                    );
+                    hash1.update_byte(history[bs + i], history[bs + i + l_usize]);
                     let cand_i = i + 1;
                     if cand_i >= last_match_end {
                         candidates.push((hash1.value, cand_i));
@@ -196,24 +234,12 @@ pub fn compress_block(
                     j += 1;
                 }
             }
-            // Check candidates.
             for (hv, cand_i) in candidates {
-                let k = h.find_match(&history[block_start as usize..], cand_i, hv);
+                let k = h.find_match(&history[bs..], cand_i, hv, block_size);
                 if k != NOT_FOUND {
                     if let Some(mend) = record_match(
-                        h,
-                        round_matches,
-                        l,
-                        min_match,
-                        base_len,
-                        block_start,
-                        history,
-                        block_size,
-                        &mut stats,
-                        last_match_end,
-                        &mut literal_bytes,
-                        cand_i,
-                        k,
+                        h, round_matches, compare_digests, l, min_match, base_len, block_start, history, block_size,
+                        &mut stats, last_match_end, &mut literal_bytes, cand_i, k,
                     ) {
                         last_match_end = mend;
                         break;
@@ -221,7 +247,7 @@ pub fn compress_block(
                 }
             }
         }
-        h.add_hash(block_start, i, hash1.value);
+        h.add_hash(block_start, i, hash1.value, block_size, &history[bs..]);
     }
 
     (literal_bytes, stats)

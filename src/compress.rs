@@ -50,13 +50,19 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
         min_match = 512; // non-CDC default -l
     }
     if l == 0 {
-        l = min_match; // non-exhaustive: L = min_match
+        // m5 performs exhaustive search: L is half the rounded power-of-two.
+        l = if opts.method == 5 {
+            crate::matchfind::hash_table::rounddown_to_power_of_2(min_match + 1) / 2
+        } else {
+            min_match
+        };
     }
     if min_match == 0 {
         min_match = l;
     }
     let base_len = min_match.min(dict_min_match);
     let round_matches = opts.method == 3;
+    let compare_digests = opts.method <= 3;
     let io_lz = matches!(opts.layout, Layout::IoLz);
     let future_lz = matches!(opts.layout, Layout::FutureLz);
     let index_lz = matches!(opts.layout, Layout::IndexLz);
@@ -79,7 +85,7 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
         Some(BlockChecksum::new(desc, &seed))
     };
 
-    let mut hash = HashTable::new(l, filesize);
+    let mut hash = HashTable::new(l, filesize, compare_digests, round_matches, min_match, 1);
 
     // ---- Pass 1 ----
     let bufsize = opts.bufsize as usize;
