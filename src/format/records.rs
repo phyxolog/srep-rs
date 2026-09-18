@@ -89,16 +89,3 @@ pub fn memcpy_lz_match(dest: &mut [u8], src_start: usize, len: usize) {
         dest[i] = v;
     }
 }
-
-/// memcpy_lz_match between two distinct buffers (dest and src may not be the
-/// same allocation in the decompressor; here they share `out`).
-#[inline]
-pub fn memcpy_lz_match_into(dest: &mut [u8], dest_off: usize, src: &[u8]) {
-    let len = src.len();
-    if len == 0 {
-        return;
-    }
-    for i in 0..len {
-        dest[dest_off + i] = src[i];
-    }
-}

@@ -199,13 +199,13 @@ pub fn compress_block(
     // Special handling for the first L bytes.
     hash1.moveto(&history[bs..]);
     let k = h.find_match(&history[bs..], 0, hash1.value, block_size);
-    if k != NOT_FOUND {
-        if let Some(mend) = record_match(
+    if k != NOT_FOUND
+        && let Some(mend) = record_match(
             h, round_matches, compare_digests, l, min_match, base_len, block_start, history,
             block_size, &mut stats, last_match_end, &mut literal_bytes, 0, k,
-        ) {
-            last_match_end = mend;
-        }
+        )
+    {
+        last_match_end = mend;
     }
     h.add_hash(block_start, 0, hash1.value, block_size, &history[bs..]);
 
@@ -276,14 +276,14 @@ pub fn compress_block(
             }
             for (hv, cand_i) in candidates {
                 let k = h.find_match(&history[bs..], cand_i, hv, block_size);
-                if k != NOT_FOUND {
-                    if let Some(mend) = record_match(
+                if k != NOT_FOUND
+                    && let Some(mend) = record_match(
                         h, round_matches, compare_digests, l, min_match, base_len, block_start, history, block_size,
                         &mut stats, last_match_end, &mut literal_bytes, cand_i, k,
-                    ) {
-                        last_match_end = mend;
-                        break;
-                    }
+                    )
+                {
+                    last_match_end = mend;
+                    break;
                 }
             }
         }

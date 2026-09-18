@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Write};
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use srep_rs::checksum::hash_by_name;
@@ -34,6 +34,7 @@ struct Cli {
     dict_hashsize: u64,
     dict_chunk: u64,
     dict_min_match: u64,
+    tempfile: Option<String>,
     filenames: Vec<String>,
 }
 
@@ -57,6 +58,7 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
         dict_hashsize: 0,
         dict_chunk: 0,
         dict_min_match: 0,
+        tempfile: None,
         filenames: Vec::new(),
     };
 
@@ -77,27 +79,19 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
                 }
                 let b = part.as_bytes();
                 match b[0] {
-                    b'd' => cli.dictsize = srep_rs::cli::parse_mem_option(&part[1..], 'm').unwrap_or(0),
-                    b'h' => cli.dict_hashsize = srep_rs::cli::parse_mem_option(&part[1..], 'm').unwrap_or(0),
-                    b'l' => cli.dict_min_match = srep_rs::cli::parse_mem(&part[1..], 'b').unwrap_or(0),
-                    b'c' => cli.dict_chunk = srep_rs::cli::parse_mem(&part[1..], 'b').unwrap_or(0),
-                    b'a' => {} // ignore -da
-                    _ => cli.dictsize = srep_rs::cli::parse_mem_option(part, 'm').unwrap_or(0),
+                    b'd' => cli.dictsize = srep_rs::cli::parse_mem_option(&part[1..], 'm').map_err(|e| (2, e))?,
+                b'h' => cli.dict_hashsize = srep_rs::cli::parse_mem_option(&part[1..], 'm').map_err(|e| (2, e))?,
+                b'l' => cli.dict_min_match = srep_rs::cli::parse_mem(&part[1..], 'b').map_err(|e| (2, e))?,
+                b'c' => cli.dict_chunk = srep_rs::cli::parse_mem(&part[1..], 'b').map_err(|e| (2, e))?,
+                b'a' => {} // ignore -da
+                _ => cli.dictsize = srep_rs::cli::parse_mem_option(part, 'm').map_err(|e| (2, e))?,
                 }
             }
         } else if let Some(rest) = a.strip_prefix("-m") {
             let d = rest.as_bytes();
-            let is_method = if d.len() >= 1 && (d[0].is_ascii_digit() || d[0] == b'x') {
-                if d.len() == 1 {
-                    true
-                } else if d.len() == 2 && (d[1] == b'f' || d[1] == b'o') {
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            let is_method = !d.is_empty()
+                && (d[0].is_ascii_digit() || d[0] == b'x')
+                && (d.len() == 1 || (d.len() == 2 && (d[1] == b'f' || d[1] == b'o')));
             if is_method {
                 let m = if d[0] == b'x' { 5 } else { (d[0] - b'0') as i8 };
                 cli.method = m;
@@ -108,8 +102,9 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
                 } else {
                     Layout::IndexLz
                 };
-            } else if let Ok(m) = srep_rs::cli::parse_mem(rest, 'b') {
-                cli.maximum_save = m as u32;
+            } else {
+                let m = srep_rs::cli::parse_mem(rest, 'b').map_err(|e| (2, e))?;
+                cli.maximum_save = u32::try_from(m).map_err(|_| (2, "size too large".into()))?;
             }
         } else if a == "-hash-" || a == "-nomd5" {
             cli.hash_name = String::new();
@@ -129,13 +124,23 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
             cli.vm_block = srep_rs::cli::parse_mem(v, 'm').map_err(|e| (2, e))?;
         } else if let Some(v) = a.strip_prefix("-vmfile=") {
             cli.vmfile = v.to_string();
+        } else if a == "-temp=" {
+            cli.tempfile = Some(String::new());
+        } else if let Some(v) = a.strip_prefix("-temp=") {
+            cli.tempfile = Some(v.to_string());
         } else if a.starts_with('-') && a != "-" {
-            // ignore unknown options for now
+            return Err((2, format!("Invalid option: {a}")));
         } else {
             cli.filenames.push(a.clone());
         }
     }
 
+    if cli.filenames.is_empty()
+        && !std::io::stdin().is_terminal()
+        && !std::io::stdout().is_terminal()
+    {
+        cli.filenames = vec!["-".to_string(), "-".to_string()];
+    }
     if cli.filenames.is_empty() {
         return Err((2, "usage: srep-rs [-d] [options] infile [outfile]".into()));
     }
@@ -153,36 +158,113 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
     };
 
     if cli.decompress {
-        let mut opts = DecompressOptions::default();
-        opts.forced_checksum = if cli.hash_name.is_empty() {
-            Some(srep_rs::checksum::BlockChecksum::None)
-        } else {
-            None
+        let mut opts = DecompressOptions {
+            forced_checksum: if cli.hash_name.is_empty() {
+                Some(srep_rs::checksum::BlockChecksum::None)
+            } else {
+                None
+            },
+            vm_block: cli.vm_block,
+            vmfile_name: cli.vmfile.clone(),
+            bufsize: cli.bufsize,
+            maximum_save: cli.maximum_save,
+            tempfile_name: cli.tempfile.clone(),
+            ..DecompressOptions::default()
         };
         if cli.mem != 0 {
             opts.vm_mem = cli.mem;
         }
-        opts.vm_block = cli.vm_block;
-        opts.vmfile_name = cli.vmfile.clone();
-        opts.bufsize = cli.bufsize;
-        opts.maximum_save = cli.maximum_save;
-        let mut fin = File::open(&fin_name).map_err(|e| (3, format!("Can't open {fin_name}: {e}")))?;
-        let mut fout = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&fout_name)
-            .map_err(|e| (3, format!("Can't open {fout_name}: {e}")))?;
-        srep_rs::decode::decompress(&mut fin, &mut fout, &opts).map_err(|e| (4, e))?;
+
+        // Spool file: a seekable copy of a stdin archive, and/or the seekable
+        // output backend when writing to stdout (the decoder rereads prior output).
+        let spool = match &cli.tempfile {
+            Some(s) if s.is_empty() => None, // -temp= : explicitly disabled
+            Some(s) => Some(s.clone()),
+            None => Some("srep-data.tmp".to_string()),
+        };
+        let fin_is_stdin = fin_name == "-";
+        let fout_is_stdout = fout_name == "-";
+        if spool.is_none() && (fin_is_stdin || fout_is_stdout) {
+            return Err((3, "without tempfile isn't supported".into()));
+        }
+
+        // Open a seekable input: a stdin archive is spooled to disk (the decoder
+        // seeks for v4 index/footer), a regular file is opened read/write.
+        let (mut fin, input_spool): (File, Option<String>) = if fin_is_stdin {
+            let path = spool.clone().unwrap();
+            let mut write_handle = File::create(&path)
+                .map_err(|e| (3, format!("Can't create {path}: {e}")))?;
+            std::io::copy(&mut std::io::stdin(), &mut write_handle)
+                .map_err(|e| (3, e.to_string()))?;
+            drop(write_handle);
+            let fh = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| (3, format!("Can't open {path}: {e}")))?;
+            (fh, Some(path))
+        } else {
+            (
+                File::open(&fin_name).map_err(|e| (3, format!("Can't open {fin_name}: {e}")))?,
+                None,
+            )
+        };
+
+        if fout_is_stdout {
+            // Output backend is a temp file; mirror each block to stdout.
+            let out_spool = if fin_is_stdin {
+                format!("{}.out", spool.as_deref().unwrap())
+            } else {
+                spool.clone().unwrap()
+            };
+            let mut temp = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&out_spool)
+                .map_err(|e| (3, format!("Can't open {out_spool}: {e}")))?;
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            let result = srep_rs::decode::decompress(&mut fin, &mut temp, Some(&mut lock), &opts);
+            drop(lock);
+            let _ = std::fs::remove_file(&out_spool);
+            if let Some(p) = &input_spool {
+                let _ = std::fs::remove_file(p);
+            }
+            result.map_err(|e| (4, e))?;
+        } else {
+            let mut fout = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&fout_name)
+                .map_err(|e| (3, format!("Can't open {fout_name}: {e}")))?;
+            let result =
+                srep_rs::decode::decompress(&mut fin, &mut fout, None::<&mut std::io::Stdout>, &opts);
+            if let Some(p) = &input_spool {
+                let _ = std::fs::remove_file(p);
+            }
+            if result.is_err() && fout_name != "-" {
+                let _ = std::fs::remove_file(&fout_name);
+            }
+            result.map_err(|e| (4, e))?;
+        }
     } else {
-        // Compression.
+        // Compression holds the whole input in RAM, so stdin needs no spool file.
         let desc = hash_by_name(&cli.hash_name).ok_or((2, "unknown hash".to_string()))?;
-        let input = std::fs::read(&fin_name).map_err(|e| (3, format!("Can't open {fin_name}: {e}")))?;
+        let input = if fin_name == "-" {
+            let mut v = Vec::new();
+            std::io::stdin().read_to_end(&mut v).map_err(|e| (3, e.to_string()))?;
+            v
+        } else {
+            std::fs::read(&fin_name).map_err(|e| (3, format!("Can't open {fin_name}: {e}")))?
+        };
         let opts = CompressOptions {
-            method: cli.method as i8,
-            l: cli.l as u64,
-            min_match: cli.min_match as u64,
+            method: cli.method,
+            l: cli.l,
+            min_match: cli.min_match,
             dict_min_match: if cli.dict_min_match != 0 { cli.dict_min_match } else { 512 },
             bufsize: cli.bufsize,
             layout: cli.layout,
@@ -193,8 +275,15 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
             dict_chunk: cli.dict_chunk,
         };
         let out = srep_rs::compress::compress(&input, &opts).map_err(|e| (4, e))?;
-        let mut f = File::create(&fout_name).map_err(|e| (3, format!("Can't open {fout_name}: {e}")))?;
-        f.write_all(&out).map_err(|e| (3, e.to_string()))?;
+        if fout_name == "-" {
+            std::io::stdout().write_all(&out).map_err(|e| (3, e.to_string()))?;
+        } else {
+            let mut f = File::create(&fout_name).map_err(|e| (3, format!("Can't open {fout_name}: {e}")))?;
+            if let Err(e) = f.write_all(&out) {
+                let _ = std::fs::remove_file(&fout_name);
+                return Err((3, e.to_string()));
+            }
+        }
     }
     Ok(())
 }
@@ -202,7 +291,7 @@ fn run(args: &[String]) -> Result<(), (u8, String)> {
 // Tiny hex decoder for --checksum-seed.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err(());
         }
         (0..s.len())

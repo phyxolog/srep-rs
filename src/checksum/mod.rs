@@ -93,7 +93,7 @@ pub enum BlockChecksum {
     Md5,
     Sha1,
     Sha512,
-    Vmac(VHash),
+    Vmac(Box<VHash>),
     SipHash(SipHash),
     None,
 }
@@ -108,7 +108,7 @@ impl BlockChecksum {
             4 => {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&seed[..32]);
-                BlockChecksum::Vmac(VHash::new_with_key(&key))
+                BlockChecksum::Vmac(Box::new(VHash::new_with_key(&key)))
             }
             5 => {
                 let mut key = [0u8; 16];

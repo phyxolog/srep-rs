@@ -19,7 +19,7 @@ fn overlap_copy(out: &mut [u8], dst_off: usize, src_off: usize, len: usize) {
 pub fn decompress_future_lz(
     round_matches: bool,
     l: u32,
-    fout: &mut (impl Read + Seek),
+    backend: &mut (impl Read + Seek),
     block_start: u64,
     statraw: &[u32],
     literals: &[u8],
@@ -62,15 +62,11 @@ pub fn decompress_future_lz(
 
     // 2. Process matches with dest < block_end, in destination order.
     let mut out_pos: usize = 0;
-    loop {
-        let first = match heap.begin() {
-            Some(e) => *e,
-            None => break,
-        };
-        if first.dest >= block_end {
+    while let Some(first) = heap.begin() {
+        let e = *first;
+        if e.dest >= block_end {
             break;
         }
-        let e = first;
         if e.is_marking_point() {
             vm.restore_from_disk(mm, heap, &e)?;
         } else {
@@ -89,8 +85,8 @@ pub fn decompress_future_lz(
             // Copy match data.
             if e.len >= maximum_save && e.src < block_start {
                 let mut tmp = vec![0u8; e.len as usize];
-                fout.seek(SeekFrom::Start(e.src)).map_err(|x| x.to_string())?;
-                fout.read_exact(&mut tmp).map_err(|x| x.to_string())?;
+                backend.seek(SeekFrom::Start(e.src)).map_err(|x| x.to_string())?;
+                backend.read_exact(&mut tmp).map_err(|x| x.to_string())?;
                 out[out_pos..out_pos + e.len as usize].copy_from_slice(&tmp);
             } else if e.index != INVALID_INDEX {
                 mm.restore(e.index, &mut out[out_pos..], e.len as usize);
@@ -123,10 +119,12 @@ pub fn decompress_future_lz(
                 decode_lz_match(statraw, &mut cur, true, round_matches, l, block_pos);
             if lz.dest >= block_end {
                 if lz.len >= maximum_save {
-                    // No saved data; on demand it is reread from fout.
+                    // No saved data; on demand it is reread from backend.
                 } else {
                     while lz.len as u64 > mm.available_space() {
-                        vm.save_to_disk(mm, heap)?;
+                        if !vm.save_to_disk(mm, heap)? {
+                            return Err("VM spill stalled: a match exceeds the VM block size".to_string());
+                        }
                     }
                     let src_off = (lz.src - block_start) as usize;
                     let idx = mm.save(&out[src_off..src_off + lz.len as usize], lz.len as usize);

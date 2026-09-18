@@ -25,6 +25,8 @@ pub struct DecompressOptions {
     pub bufsize: u64,
     /// -m value (bytes): matches >= this are reread from output (default: unlimited).
     pub maximum_save: u32,
+    /// -temp= name: the spool file used for stdin archives / stdout output.
+    pub tempfile_name: Option<String>,
 }
 
 impl Default for DecompressOptions {
@@ -36,6 +38,7 @@ impl Default for DecompressOptions {
             vmfile_name: "srep-virtual-memory.tmp".to_string(),
             bufsize: 8 * MB,
             maximum_save: u32::MAX,
+            tempfile_name: None,
         }
     }
 }
@@ -48,7 +51,6 @@ fn physical_memory() -> u64 {
         for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
             if let Some(rest) = line.strip_prefix("MemTotal:") {
                 let kb: u64 = rest
-                    .trim()
                     .split_whitespace()
                     .next()
                     .and_then(|s| s.parse().ok())
@@ -61,18 +63,20 @@ fn physical_memory() -> u64 {
     if let Ok(out) = std::process::Command::new("sysctl")
         .args(["-n", "hw.memsize"])
         .output()
+        && let Some(v) = String::from_utf8(out.stdout).ok().and_then(|s| s.trim().parse::<u64>().ok())
     {
-        if let Some(v) = String::from_utf8(out.stdout).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
-            return v;
-        }
+        return v;
     }
     8 * 1024 * MB
 }
 
-/// Decompress `fin` (archive) into `fout` (created/truncated read-write).
+/// Decompress `fin` (archive) into `backend` (created/truncated read-write).
+/// `echo`, when set, mirrors each output block to a second writer (used to stream
+/// a temp-file spool out to stdout).
 pub fn decompress(
     fin: &mut File,
-    fout: &mut File,
+    backend: &mut (impl Read + Write + Seek),
+    mut echo: Option<&mut impl Write>,
     opts: &DecompressOptions,
 ) -> Result<(), String> {
     let filesize = fin.metadata().map_err(|e| e.to_string())?.len();
@@ -87,7 +91,7 @@ pub fn decompress(
 
     let checksum = match &opts.forced_checksum {
         Some(c) => Some(c.clone()),
-        None => resolve_checksum(hdr.hash_num, &seed),
+        None => resolve_checksum(hdr.hash_num, hdr.hash_size, &seed),
     };
 
     let header_size = 3 * 4 + hdr.hash_size;
@@ -102,8 +106,15 @@ pub fn decompress(
         None
     };
 
+    // compbufsize = bufsize + 4*(MAX_HEADER_SIZE + MAX_HASH_SIZE + FUTURELZ_MAX_STATS_PER_BLOCK(bufsize))
+    //  = bufsize + 4*(4 + 256 + bufsize/4)  = 2*bufsize + 1040
+    let compbufsize = opts.bufsize
+        + 4 * (crate::types::MAX_HEADER_SIZE as u64
+            + crate::types::MAX_HASH_SIZE as u64
+            + opts.bufsize / 4);
+
     // Memory/VM managers for future/index decode.
-    let io_mem = opts.vm_block + opts.bufsize + opts.bufsize + opts.bufsize / 4 + 8 * MB;
+    let io_mem = opts.vm_block + opts.bufsize + compbufsize + 8 * MB;
     let mm_limit = if opts.vm_mem >= io_mem + opts.vm_block * 4 {
         opts.vm_mem - io_mem
     } else {
@@ -141,9 +152,28 @@ pub fn decompress(
         let b0 = u32::from_le_bytes(hbuf[0..4].try_into().unwrap());
         let b1 = u32::from_le_bytes(hbuf[4..8].try_into().unwrap());
         let b2 = u32::from_le_bytes(hbuf[8..12].try_into().unwrap());
-        let literal_bytes = b0 as usize;
-        let origsize = b1 as usize;
-        let statsize1 = b2 as usize;
+        let literal_bytes = b0 as u64;
+        let origsize = b1 as u64;
+        let statsize1 = b2 as u64;
+        if origsize > opts.bufsize {
+            return Err(format!(
+                "uncompressed block size is {origsize} bytes, while maximum supported size is {}",
+                opts.bufsize
+            ));
+        }
+        if !statsize1.is_multiple_of(4)
+            || literal_bytes + statsize1 > compbufsize
+            || literal_bytes > compbufsize
+            || statsize1 > compbufsize
+        {
+            return Err(format!(
+                "compressed block size is {} bytes, while maximum supported size is {compbufsize}",
+                literal_bytes + statsize1
+            ));
+        }
+        let literal_bytes = literal_bytes as usize;
+        let origsize = origsize as usize;
+        let statsize1 = statsize1 as usize;
 
         // Resolve the match list for this block.
         let statraw: Vec<u32>;
@@ -151,6 +181,9 @@ pub fn decompress(
             let v4 = v4.as_ref().unwrap();
             let count = v4.statsize_buf[statsize_ptr] as usize;
             statsize_ptr += 1;
+            if !count.is_multiple_of(4) || stat_ptr + count / 4 > v4.statbuf.len() {
+                return Err("broken SREP index".to_string());
+            }
             statraw = v4.statbuf[stat_ptr..stat_ptr + count / 4].to_vec();
             stat_ptr += count / 4;
         } else {
@@ -158,7 +191,7 @@ pub fn decompress(
             let mut mbuf = vec![0u8; count];
             fin.read_exact(&mut mbuf)
                 .map_err(|e| format!("unexpected EOF reading match list: {e}"))?;
-            statraw = mbuf.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            statraw = mbuf.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
         }
 
         // Read literals.
@@ -168,13 +201,13 @@ pub fn decompress(
 
         out.resize(origsize, 0);
         let ok = if io_lz {
-            backward::decompress(round_matches, hdr.base_len, fout, block_start, &statraw, &lbuf, &mut out)
+            backward::decompress(round_matches, hdr.base_len, &mut *backend, block_start, &statraw, &lbuf, &mut out)
         } else {
             let max_save = opts.maximum_save;
             future::decompress_future_lz(
                 round_matches,
                 hdr.base_len,
-                fout,
+                &mut *backend,
                 block_start,
                 &statraw,
                 &lbuf,
@@ -197,8 +230,11 @@ pub fn decompress(
             }
         }
 
-        fout.seek(SeekFrom::Start(block_start)).map_err(|e| e.to_string())?;
-        fout.write_all(&out).map_err(|e| e.to_string())?;
+        backend.seek(SeekFrom::Start(block_start)).map_err(|e| e.to_string())?;
+        backend.write_all(&out).map_err(|e| e.to_string())?;
+        if let Some(w) = echo.as_deref_mut() {
+            w.write_all(&out).map_err(|e| e.to_string())?;
+        }
 
         block_start += origsize as u64;
 
@@ -207,7 +243,7 @@ pub fn decompress(
         }
     }
 
-    fout.flush().map_err(|e| e.to_string())?;
+    backend.flush().map_err(|e| e.to_string())?;
     // Remove the VM spill file if it was created.
     let _ = std::fs::remove_file(&opts.vmfile_name);
     Ok(())
@@ -219,6 +255,9 @@ struct IndexData {
 }
 
 fn read_index(fin: &mut File, filesize: u64, full_archive_header_size: u64) -> Result<IndexData, String> {
+    if filesize < full_archive_header_size + INDEX_LZ_FOOTER_SIZE as u64 {
+        return Err("broken SREP footer".to_string());
+    }
     let mut footer_words = [0u32; 6];
     fin.seek(SeekFrom::Start(filesize - INDEX_LZ_FOOTER_SIZE as u64))
         .map_err(|e| e.to_string())?;
@@ -232,7 +271,14 @@ fn read_index(fin: &mut File, filesize: u64, full_archive_header_size: u64) -> R
     let stat_size = footer.total_stat_size;
     let footer_size = footer.footer_size as u64;
 
-    if stat_size + footer_size > filesize - 16 {
+    if footer.footer_size < INDEX_LZ_FOOTER_SIZE as u32
+        || !(footer.footer_size - INDEX_LZ_FOOTER_SIZE as u32).is_multiple_of(4)
+        || !footer.total_stat_size.is_multiple_of(4)
+    {
+        return Err("broken SREP index".to_string());
+    }
+
+    if stat_size + footer_size > filesize - full_archive_header_size {
         return Err("broken SREP footer".to_string());
     }
 
@@ -242,8 +288,10 @@ fn read_index(fin: &mut File, filesize: u64, full_archive_header_size: u64) -> R
         .map_err(|e| e.to_string())?;
     fin.read_exact(&mut statbuf).map_err(|e| e.to_string())?;
     let statbuf: Vec<u32> = statbuf
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
 
     // Read per-block stat_size array.
@@ -264,11 +312,14 @@ fn read_index(fin: &mut File, filesize: u64, full_archive_header_size: u64) -> R
     })
 }
 
-fn resolve_checksum(hash_num: u32, seed: &[u8]) -> Option<BlockChecksum> {
+fn resolve_checksum(hash_num: u32, hash_size: usize, seed: &[u8]) -> Option<BlockChecksum> {
     use crate::checksum::hash_by_num;
     let desc = hash_by_num(hash_num)?;
     if desc.hash_num == 1 {
-        return None;
+        return None; // "no checksum saved" tag
+    }
+    if hash_size != desc.hash_size || seed.len() != desc.hash_seed_size {
+        return None; // malformed header -> skip, don't slice
     }
     Some(BlockChecksum::new(desc, seed))
 }
@@ -280,4 +331,26 @@ fn read_exact_u32s(fin: &mut File, words: &mut [u32]) -> Result<(), String> {
         *w = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_checksum;
+
+    #[test]
+    fn checksum_seed_too_short_is_skipped() {
+        // vmac (num 4) stores a 32-byte seed; an 8-byte seed must not slice/panic.
+        assert!(resolve_checksum(4, 16, &[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn checksum_siphash_valid_seed_resolves() {
+        // siphash (num 5): 16-byte seed, 8-byte digest.
+        assert!(resolve_checksum(5, 8, &[0u8; 16]).is_some());
+    }
+
+    #[test]
+    fn checksum_unknown_tag_is_skipped() {
+        assert!(resolve_checksum(99, 16, &[]).is_none());
+    }
 }

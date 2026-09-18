@@ -194,7 +194,7 @@ fn zpaq_find_chunks(ptr: usize, pend: usize, buf: &[u8], bufend: usize, l: u64, 
     let mut hash: u32 = 0;
     let mut c1: u8 = 0;
     let mut o1 = [0u8; 256];
-    let start = if ptr >= 8000 { ptr - 8000 } else { 0 };
+    let start = ptr.saturating_sub(8000);
     let mut p = start;
     let mut lastp = p;
     let mut marks = Vec::new();

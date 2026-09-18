@@ -12,7 +12,7 @@ pub fn power(base: u64, n: u32) -> u64 {
     let mut n = n;
     let mut result: u64 = 1;
     while n != 0 {
-        if n % 2 != 0 {
+        if !n.is_multiple_of(2) {
             result = result.wrapping_mul(base);
             n -= 1;
         }
@@ -184,16 +184,16 @@ mod tests {
         let mut h = PolynomialRollingHash::with_buffer(&buf, l, seed);
 
         let mut naive: u64 = 0;
-        for i in 0..l {
-            naive = naive.wrapping_mul(seed).wrapping_add(buf[i] as u64);
+        for &b in buf.iter().take(l) {
+            naive = naive.wrapping_mul(seed).wrapping_add(b as u64);
         }
         assert_eq!(h.value, naive);
 
         // Roll by 3 bytes.
         h.update_n::<3>(&buf);
         let mut naive2: u64 = 0;
-        for i in 3..3 + l {
-            naive2 = naive2.wrapping_mul(seed).wrapping_add(buf[i] as u64);
+        for &b in buf.iter().skip(3).take(l) {
+            naive2 = naive2.wrapping_mul(seed).wrapping_add(b as u64);
         }
         assert_eq!(h.value, naive2);
     }

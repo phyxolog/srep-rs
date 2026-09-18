@@ -17,12 +17,12 @@ fn overlap_copy(out: &mut [u8], dst_off: usize, src_off: usize, len: usize) {
 }
 
 /// Decompress one IO-LZ block. `statraw` is the inline match list (u32 words),
-/// `literals` the literal bytes, `out` the full output block buffer. `fout` is
+/// `literals` the literal bytes, `out` the full output block buffer. `backend` is
 /// the output file, used to read match data from earlier blocks.
 pub fn decompress(
     round_matches: bool,
     l: u32,
-    fout: &mut (impl Read + Seek),
+    backend: &mut (impl Read + Seek),
     block_start: u64,
     statraw: &[u32],
     literals: &[u8],
@@ -56,10 +56,10 @@ pub fn decompress(
             let bytes = len.min((block_start - src) as usize);
             if bytes > 0 {
                 let mut tmp = vec![0u8; bytes];
-                if fout.seek(std::io::SeekFrom::Start(src)).is_err() {
+                if backend.seek(std::io::SeekFrom::Start(src)).is_err() {
                     return false;
                 }
-                if fout.read_exact(&mut tmp).is_err() {
+                if backend.read_exact(&mut tmp).is_err() {
                     return false;
                 }
                 out[out_pos..out_pos + bytes].copy_from_slice(&tmp);

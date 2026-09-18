@@ -101,11 +101,7 @@ impl DictionaryCompressor {
                         // no_match
                     } else {
                         let low_bound = if m >= data_start {
-                            if m - data_start > i {
-                                0
-                            } else {
-                                i - (m - data_start)
-                            }
+                            i.saturating_sub(m - data_start)
                         } else {
                             i - m
                         };

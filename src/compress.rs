@@ -35,7 +35,7 @@ fn round_up_to(a: usize, b: usize) -> usize {
     if b == 0 {
         a
     } else {
-        (a + b - 1) / b * b
+        a.div_ceil(b) * b
     }
 }
 
@@ -96,6 +96,12 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
             s
         }
     };
+    if desc.hash_num != 1 && seed.len() != desc.hash_seed_size {
+        return Err(format!(
+            "checksum seed for {} must be {} bytes, got {}",
+            desc.hash_name, desc.hash_seed_size, seed.len()
+        ));
+    }
     let checksum = if desc.hash_num == 1 {
         None
     } else {
@@ -166,7 +172,7 @@ pub fn compress(input: &[u8], opts: &CompressOptions) -> Result<Vec<u8>, String>
                 round_matches,
                 base_len as u32,
                 (end - block_start + 1) as u32,
-                base_len as u64,
+                base_len,
                 base_len as u32,
             );
             compress_block(

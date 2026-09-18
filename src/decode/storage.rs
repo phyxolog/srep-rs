@@ -9,7 +9,7 @@ use crate::types::MB;
 
 const CHUNK_SIZE: usize = 64;
 const USEFUL_CHUNK_SPACE: usize = CHUNK_SIZE - 4;
-const A_BLOCK_SIZE: usize = 1 * MB as usize;
+const A_BLOCK_SIZE: usize = MB as usize;
 const K: u32 = (A_BLOCK_SIZE / CHUNK_SIZE) as u32; // 16384
 const K1: u32 = K - 1;
 const LBK: u32 = 14;
@@ -48,11 +48,7 @@ impl MemoryManager {
 
     pub fn available_space(&self) -> u64 {
         let used = self.used_chunks * USEFUL_CHUNK_SPACE as u64;
-        if self.useful_memory > used {
-            self.useful_memory - used
-        } else {
-            0
-        }
+        self.useful_memory.saturating_sub(used)
     }
 
     pub fn current_mem(&self) -> u64 {
@@ -228,10 +224,11 @@ impl VirtualMemoryManager {
         &mut self,
         mm: &mut MemoryManager,
         heap: &mut LzMatchHeap,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         self.ensure_open()?;
         let vs = self.vmblock_size as usize;
         let mut vmbuf = std::mem::take(&mut self.vmbuf);
+        let mut spilled = false;
 
         // Descending dest order; the very first (largest) is the barrier.
         let mut to_erase = Vec::new();
@@ -258,6 +255,7 @@ impl VirtualMemoryManager {
             let idx = e.index;
             mm.free(idx);
             p += 20 + e.len as usize;
+            spilled = true;
             to_erase.push(*e);
         }
         vmbuf[p..p + 4].copy_from_slice(&0u32.to_le_bytes());
@@ -291,7 +289,7 @@ impl VirtualMemoryManager {
             seq: 0,
         };
         heap.insert(mark);
-        Ok(())
+        Ok(spilled)
     }
 
     /// Restore matches pointed to by `mark` from disk.
@@ -302,7 +300,9 @@ impl VirtualMemoryManager {
         mark: &HeapEntry,
     ) -> Result<(), String> {
         while mm.available_space() < self.vmblock_size {
-            self.save_to_disk(mm, heap)?;
+            if !self.save_to_disk(mm, heap)? {
+                return Err("VM spill stalled: a match exceeds the VM block size".to_string());
+            }
         }
         self.ensure_open()?;
         let block = mark.src as u32;
@@ -438,5 +438,47 @@ impl LzMatchHeap {
 impl Default for LzMatchHeap {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_spill_stalls_when_match_exceeds_block() {
+        let mut mm = MemoryManager::new(MB);
+        let mut vm = VirtualMemoryManager::new("vm_spill_test.tmp", 64);
+        let mut heap = LzMatchHeap::new();
+        heap.insert_barrier();
+
+        // A saved match whose spill record (20 + len + 4 > vmblock_size) cannot
+        // fit in one 64-byte VM block: 20 + 41 + 4 = 65 > 64.
+        let idx = mm.save(&[0u8; 41], 41);
+        heap.insert(HeapEntry {
+            src: 0,
+            dest: 1,
+            len: 41,
+            index: idx,
+            seq: 0,
+        });
+
+        // Exhaust the allocator below one VM block so restore_from_disk must spill.
+        let _keep = mm.save(&[0u8; 16382 * USEFUL_CHUNK_SPACE], 16382 * USEFUL_CHUNK_SPACE);
+        assert!(mm.available_space() < vm.vmblock_size);
+
+        let mark = HeapEntry {
+            src: 0,
+            dest: 0,
+            len: 0,
+            index: INVALID_INDEX,
+            seq: 0,
+        };
+        let result = vm.restore_from_disk(&mut mm, &mut heap, &mark);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("VM spill stalled"));
+
+        drop(vm);
+        let _ = std::fs::remove_file("vm_spill_test.tmp");
     }
 }

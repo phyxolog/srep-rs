@@ -109,7 +109,7 @@ fn nh_tail(m: &[u8], m_word_base: usize, kp: &[u64], remaining: usize) -> (u64, 
         }
     }
 
-    if remaining % 16 > 0 {
+    if !remaining.is_multiple_of(16) {
         let mut buf = [0u8; 16];
         let tail_start = m_word_base * 8 + (remaining / 16) * 16;
         let tlen = remaining % 16;
@@ -387,6 +387,12 @@ impl VHash {
     }
 }
 
+impl Default for VHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `VDigest`: two VHash instances sharing one key; 20-byte digest output.
 #[derive(Clone)]
 pub struct VDigest {
@@ -407,6 +413,12 @@ impl VDigest {
         let mut second = [0u8; 16];
         self.vhash2.compute(data, &mut second);
         result[4..20].copy_from_slice(&second);
+    }
+}
+
+impl Default for VDigest {
+    fn default() -> Self {
+        Self::new()
     }
 }
 #[cfg(test)]
